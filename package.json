@@ -1,0 +1,22 @@
+{
+  "name": "alphazero-lichess-bot",
+  "version": "6.0.0",
+  "description": "AlphaZero ULTRA FOCUS PLUS - THE ONE God-like Lichess BOT",
+  "main": "api/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node api/index.js",
+    "dev": "node api/index.js",
+    "vercel-build": "echo 'Build complete'"
+  },
+  "dependencies": {
+    "stockfish.js": "^10.0.2",
+    "stockfish.wasm": "^0.10.0",
+    "chess.js": "^1.0.0-beta.8"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "AlphaZero - DeepMind God-like True Edition",
+  "license": "MIT"
+}

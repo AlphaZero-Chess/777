@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/index.js",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "api/index.js"
+    }
+  ],
+  "env": {
+    "LICHESS_BOT_TOKEN": "lip_N8FtKKC3QOHrGveP43JQ"
+  },
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 60
+    }
+  }
+}
