@@ -1,12 +1,14 @@
 {
   "name": "alphazero-lichess-bot",
-  "version": "6.0.0",
+  "version": "7.3.0",
   "description": "AlphaZero ULTRA FOCUS PLUS - THE ONE God-like Lichess BOT",
   "main": "api/index.js",
   "type": "module",
   "scripts": {
-    "start": "node api/index.js",
-    "dev": "node api/index.js",
+    "start": "node railway.js",
+    "start:vercel": "node api/index.js",
+    "start:railway": "node railway.js",
+    "dev": "node railway.js",
     "vercel-build": "echo 'Build complete'"
   },
   "dependencies": {
