@@ -326,23 +326,12 @@ async function runBot(maxRuntime = 55000) {
     console.log('═══════════════════════════════════════════════════════════════════════════════════════════════════════════════');
     console.log('🔱 AlphaZero ULTRA FOCUS PLUS v6.0.0 - THE ONE MASTERPIECE EDITION 🔱');
     console.log('═══════════════════════════════════════════════════════════════════════════════════════════════════════════════');
-    console.log('"Like a superior species landing on Earth" - GM Peter Heine Nielsen');
-    console.log('"AlphaZero plays like an alien from the future" - GM Garry Kasparov');
-    console.log('═══════════════════════════════════════════════════════════════════════════════════════════════════════════════');
-    
-    // Initialize Stockfish
-    await initStockfish();
     
     // Get account info
     let accountInfo = null;
     try {
         accountInfo = await lichess.getAccount();
         console.log(`🎯 Bot account: ${accountInfo.username}`);
-        console.log(`⚡ THE ONE's Configuration:`);
-        console.log(`   ├─ Aggression Level: ${(CONFIG.aggressionLevel * 100).toFixed(0)}%`);
-        console.log(`   ├─ Sacrifice Willingness: ${(CONFIG.sacrificeWillingness * 100).toFixed(0)}%`);
-        console.log(`   ├─ Contempt Value: ${CONFIG.contemptValue}`);
-        console.log(`   └─ Max Attack Depth: ${CONFIG.attackingDepth}`);
     } catch (error) {
         console.error('Failed to get account info:', error);
         botRunning = false;
@@ -366,77 +355,50 @@ async function runBot(maxRuntime = 55000) {
             signal: controller.signal
         });
         
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
+        if (!response.ok) {
+            throw new Error(`Lichess API error: ${response.status} ${response.statusText}`);
+        }
         
-        while (true) {
-            // Check if we've exceeded runtime
-            if (Date.now() - startTime > maxRuntime) {
-                console.log('⏰ Runtime limit reached, stopping...');
-                break;
-            }
-            
-            const { done, value } = await reader.read();
-            if (done) break;
-            
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-            
-            for (const line of lines) {
-                if (line.trim()) {
-                    try {
-                        const event = JSON.parse(line);
-                        lastEventTime = Date.now();
-                        eventsProcessed++;
-                        console.log(`📨 Event: ${event.type}`);
-                        
-                        if (event.type === 'challenge') {
-                            const challenge = event.challenge;
-                            console.log(`⚔️ Challenge from ${challenge.challenger.name}: ${challenge.variant.name} ${challenge.timeControl?.show || 'unlimited'}`);
-                            
-                            const accepted = await lichess.acceptChallenge(challenge.id);
-                            if (accepted) {
-                                console.log(`✅ Challenge accepted!`);
-                            } else {
-                                console.log(`❌ Failed to accept challenge`);
-                            }
-                        }
-                        
-                        if (event.type === 'challengeCanceled') {
-                            console.log(`❌ Challenge cancelled: ${event.challenge?.id}`);
-                        }
-                        
-                        if (event.type === 'challengeDeclined') {
-                            console.log(`❌ Challenge declined: ${event.challenge?.id}`);
-                        }
-                        
-                        if (event.type === 'gameStart') {
-                            const gameId = event.game.id;
-                            console.log(`🎮 Game started: ${gameId}`);
-                            const myColor = event.game.color;
-                            // Handle game in background
-                            handleGameStream(gameId, myColor).catch(console.error);
-                        }
-                        
-                        if (event.type === 'gameFinish') {
-                            const gameId = event.game.id;
-                            console.log(`🏁 Game finished: ${gameId}`);
-                            activeGames.delete(gameId);
-                        }
-                    } catch (e) {
-                        // Skip invalid JSON
-                    }
+        // Use text() and process - simpler approach for serverless
+        const text = await Promise.race([
+            response.text(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), maxRuntime))
+        ]).catch(() => '');
+        
+        const lines = text.split('\n').filter(line => line.trim());
+        
+        for (const line of lines) {
+            try {
+                const event = JSON.parse(line);
+                lastEventTime = Date.now();
+                eventsProcessed++;
+                console.log(`📨 Event: ${event.type}`);
+                
+                if (event.type === 'challenge') {
+                    const challenge = event.challenge;
+                    console.log(`⚔️ Challenge from ${challenge.challenger.name}`);
+                    await lichess.acceptChallenge(challenge.id);
                 }
+                
+                if (event.type === 'gameStart') {
+                    const gameId = event.game.id;
+                    console.log(`🎮 Game started: ${gameId}`);
+                    handleGameStream(gameId, event.game.color).catch(console.error);
+                }
+                
+                if (event.type === 'gameFinish') {
+                    console.log(`🏁 Game finished: ${event.game.id}`);
+                    activeGames.delete(event.game.id);
+                }
+            } catch (e) {
+                // Skip invalid JSON
             }
         }
         
         clearTimeout(timeoutId);
-        reader.releaseLock();
     } catch (error) {
-        if (error.name === 'AbortError') {
-            console.log('🔄 Stream aborted gracefully for restart');
+        if (error.name === 'AbortError' || error.message === 'timeout') {
+            console.log('🔄 Stream completed/timeout - normal for serverless');
         } else {
             console.error('Event stream error:', error);
         }
