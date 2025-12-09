@@ -7,7 +7,7 @@
     }
   ],
   "env": {
-    "LICHESS_BOT_TOKEN": "lip_N8FtKKC3QOHrGveP43JQ"
+    "LICHESS_BOT_TOKEN": "lip_zvUMgduj9NEXmIKMbaWA"
   },
   "functions": {
     "api/index.js": {
