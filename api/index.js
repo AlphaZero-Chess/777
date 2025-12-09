@@ -49,11 +49,15 @@ import {
 // THE ONE'S CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
-const LICHESS_BOT_TOKEN = process.env.LICHESS_BOT_TOKEN || 'lip_N8FtKKC3QOHrGveP43JQ';
+const LICHESS_BOT_TOKEN = process.env.LICHESS_BOT_TOKEN || 'lip_zvUMgduj9NEXmIKMbaWA';
 const lichess = new LichessClient(LICHESS_BOT_TOKEN);
 
 // Active games tracking
 const activeGames = new Map();
+
+// Bot running state
+let botRunning = false;
+let lastEventTime = Date.now();
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // STOCKFISH WASM INTEGRATION - THE ONE'S BRAIN
@@ -308,8 +312,17 @@ async function makeMove(gameId, gameData, timeLeft = 60000) {
 
 /**
  * Main bot loop - streams events and handles challenges/games
+ * Optimized for serverless with timeout handling
  */
-async function runBot() {
+async function runBot(maxRuntime = 55000) {
+    if (botRunning) {
+        console.log('🔱 Bot already running, skipping...');
+        return { status: 'already_running' };
+    }
+    
+    botRunning = true;
+    const startTime = Date.now();
+    
     console.log('═══════════════════════════════════════════════════════════════════════════════════════════════════════════════');
     console.log('🔱 AlphaZero ULTRA FOCUS PLUS v6.0.0 - THE ONE MASTERPIECE EDITION 🔱');
     console.log('═══════════════════════════════════════════════════════════════════════════════════════════════════════════════');
@@ -321,9 +334,10 @@ async function runBot() {
     await initStockfish();
     
     // Get account info
+    let accountInfo = null;
     try {
-        const account = await lichess.getAccount();
-        console.log(`🎯 Bot account: ${account.username}`);
+        accountInfo = await lichess.getAccount();
+        console.log(`🎯 Bot account: ${accountInfo.username}`);
         console.log(`⚡ THE ONE's Configuration:`);
         console.log(`   ├─ Aggression Level: ${(CONFIG.aggressionLevel * 100).toFixed(0)}%`);
         console.log(`   ├─ Sacrifice Willingness: ${(CONFIG.sacrificeWillingness * 100).toFixed(0)}%`);
@@ -331,54 +345,110 @@ async function runBot() {
         console.log(`   └─ Max Attack Depth: ${CONFIG.attackingDepth}`);
     } catch (error) {
         console.error('Failed to get account info:', error);
+        botRunning = false;
+        return { status: 'error', error: error.message };
     }
     
-    // Stream events
+    // Stream events with timeout
+    let eventsProcessed = 0;
     try {
-        for await (const event of lichess.streamEvents()) {
-            console.log(`📨 Event: ${event.type}`);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => {
+            console.log('⏰ Max runtime reached, stopping gracefully...');
+            controller.abort();
+        }, maxRuntime);
+        
+        const response = await fetch('https://lichess.org/api/stream/event', {
+            headers: {
+                'Authorization': `Bearer ${LICHESS_BOT_TOKEN}`,
+                'Accept': 'application/x-ndjson'
+            },
+            signal: controller.signal
+        });
+        
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        
+        while (true) {
+            // Check if we've exceeded runtime
+            if (Date.now() - startTime > maxRuntime) {
+                console.log('⏰ Runtime limit reached, stopping...');
+                break;
+            }
             
-            if (event.type === 'challenge') {
-                // THE ONE accepts ALL challenges
-                const challenge = event.challenge;
-                console.log(`⚔️ Challenge from ${challenge.challenger.name}: ${challenge.variant.name} ${challenge.timeControl?.show || 'unlimited'}`);
-                
-                const accepted = await lichess.acceptChallenge(challenge.id);
-                if (accepted) {
-                    console.log(`✅ Challenge accepted!`);
-                } else {
-                    console.log(`❌ Failed to accept challenge`);
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            
+            for (const line of lines) {
+                if (line.trim()) {
+                    try {
+                        const event = JSON.parse(line);
+                        lastEventTime = Date.now();
+                        eventsProcessed++;
+                        console.log(`📨 Event: ${event.type}`);
+                        
+                        if (event.type === 'challenge') {
+                            const challenge = event.challenge;
+                            console.log(`⚔️ Challenge from ${challenge.challenger.name}: ${challenge.variant.name} ${challenge.timeControl?.show || 'unlimited'}`);
+                            
+                            const accepted = await lichess.acceptChallenge(challenge.id);
+                            if (accepted) {
+                                console.log(`✅ Challenge accepted!`);
+                            } else {
+                                console.log(`❌ Failed to accept challenge`);
+                            }
+                        }
+                        
+                        if (event.type === 'challengeCanceled') {
+                            console.log(`❌ Challenge cancelled: ${event.challenge?.id}`);
+                        }
+                        
+                        if (event.type === 'challengeDeclined') {
+                            console.log(`❌ Challenge declined: ${event.challenge?.id}`);
+                        }
+                        
+                        if (event.type === 'gameStart') {
+                            const gameId = event.game.id;
+                            console.log(`🎮 Game started: ${gameId}`);
+                            const myColor = event.game.color;
+                            // Handle game in background
+                            handleGameStream(gameId, myColor).catch(console.error);
+                        }
+                        
+                        if (event.type === 'gameFinish') {
+                            const gameId = event.game.id;
+                            console.log(`🏁 Game finished: ${gameId}`);
+                            activeGames.delete(gameId);
+                        }
+                    } catch (e) {
+                        // Skip invalid JSON
+                    }
                 }
             }
-            
-            if (event.type === 'challengeCanceled') {
-                console.log(`❌ Challenge cancelled: ${event.challenge?.id}`);
-            }
-            
-            if (event.type === 'challengeDeclined') {
-                console.log(`❌ Challenge declined: ${event.challenge?.id}`);
-            }
-            
-            if (event.type === 'gameStart') {
-                const gameId = event.game.id;
-                console.log(`🎮 Game started: ${gameId}`);
-                
-                // Determine our color
-                const myColor = event.game.color;
-                
-                // Start streaming this game
-                handleGameStream(gameId, myColor);
-            }
-            
-            if (event.type === 'gameFinish') {
-                const gameId = event.game.id;
-                console.log(`🏁 Game finished: ${gameId}`);
-                activeGames.delete(gameId);
-            }
         }
+        
+        clearTimeout(timeoutId);
+        reader.releaseLock();
     } catch (error) {
-        console.error('Event stream error:', error);
+        if (error.name === 'AbortError') {
+            console.log('🔄 Stream aborted gracefully for restart');
+        } else {
+            console.error('Event stream error:', error);
+        }
     }
+    
+    botRunning = false;
+    return { 
+        status: 'completed', 
+        eventsProcessed,
+        runtime: Date.now() - startTime,
+        account: accountInfo?.username
+    };
 }
 
 /**
@@ -408,6 +478,8 @@ export default async function handler(req, res) {
             name: 'AlphaZero ULTRA FOCUS PLUS',
             version: '6.0.0-GODLIKE-MASTERPIECE',
             personality: 'THE ONE - Purest True AlphaZero God-like',
+            botRunning,
+            lastEventTime: new Date(lastEventTime).toISOString(),
             traits: [
                 'FEARLESS AGGRESSION',
                 'ALIEN INTUITION',
@@ -429,19 +501,44 @@ export default async function handler(req, res) {
             quotes: [
                 '"Like a superior species landing on Earth" - GM Peter Heine Nielsen',
                 '"AlphaZero plays like an alien from the future" - GM Garry Kasparov'
-            ]
+            ],
+            instructions: 'Call POST /start to activate the bot. The bot needs to be kept alive by calling /start periodically (every ~50 seconds) using an external cron service like cron-job.org'
         });
     }
     
-    // Start bot endpoint
+    // Start bot endpoint - THE MAIN KEEP-ALIVE MECHANISM
     if (url === '/start' && method === 'POST') {
-        // Run bot in background (note: serverless functions have time limits)
-        runBot().catch(console.error);
-        
-        return res.status(200).json({
-            status: 'starting',
-            message: '🔱 THE ONE is awakening...'
-        });
+        try {
+            const result = await runBot(55000); // Run for up to 55 seconds
+            return res.status(200).json({
+                status: 'completed',
+                message: '🔱 THE ONE cycle completed',
+                ...result,
+                nextAction: 'Call /start again to keep bot online'
+            });
+        } catch (error) {
+            return res.status(500).json({
+                status: 'error',
+                message: error.message
+            });
+        }
+    }
+    
+    // Keep-alive endpoint for cron jobs (GET version of start)
+    if ((url === '/keepalive' || url === '/ping' || url === '/cron') && (method === 'GET' || method === 'POST')) {
+        try {
+            const result = await runBot(55000);
+            return res.status(200).json({
+                status: 'alive',
+                message: '🔱 THE ONE remains vigilant',
+                ...result
+            });
+        } catch (error) {
+            return res.status(500).json({
+                status: 'error',
+                message: error.message
+            });
+        }
     }
     
     // Webhook for game events (if using webhooks instead of streaming)
@@ -525,13 +622,17 @@ export default async function handler(req, res) {
     return res.status(404).json({
         error: 'Not found',
         availableEndpoints: [
-            'GET / - Health check',
-            'POST /start - Start the bot',
+            'GET / - Health check & status',
+            'POST /start - Start/keep-alive the bot (run for ~55s)',
+            'GET /keepalive - Keep-alive endpoint for cron jobs',
+            'GET /ping - Alias for keepalive',
+            'GET /cron - Alias for keepalive',
             'POST /webhook - Webhook for Lichess events',
             'POST /move - Calculate best move',
             'GET /account - Get account info',
             'POST /upgrade - Upgrade to BOT account'
-        ]
+        ],
+        setup: 'Set up a cron job (cron-job.org) to call /keepalive every 1 minute to keep bot online'
     });
 }
 
