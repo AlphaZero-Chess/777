@@ -57,7 +57,7 @@ import {
 // THE ONE'S CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
-const LICHESS_BOT_TOKEN = process.env.LICHESS_BOT_TOKEN || 'lip_VTdjlAREz9QI7EqAayyl';
+const LICHESS_BOT_TOKEN = process.env.LICHESS_BOT_TOKEN || 'lip_6E7W6BC4nkBDFx0e06sO';
 const lichess = new LichessClient(LICHESS_BOT_TOKEN);
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1000,7 +1000,7 @@ async function runBot(maxRuntime = 55000) {
     console.log('═══════════════════════════════════════════════════════════════════════════════════════════════════════════════');
     console.log(`🔱 HYBRID Poll cycle #${pollCycleCount} completed in ${result.runtime}ms`);
     console.log(`   Challenges: ${result.challengesProcessed}, Games: ${result.gamesProcessed}, Moves: ${result.movesMade}`);
-    console.log(`   Mini-polls: ${miniPollCount}, Quick events: ${result.quickEventsProcessed}`);
+    console.log(`   Mini-polls: ${miniPollCount}, Quick challenges: ${result.quickChallengesProcessed}`);
     console.log('═══════════════════════════════════════════════════════════════════════════════════════════════════════════════');
     
     return result;
@@ -1188,7 +1188,7 @@ export default async function handler(req, res) {
         }
     }
     
-    // HYBRID: Ultra-fast ping - just activity ping + quick event peek (2-3 seconds)
+    // HYBRID: Ultra-fast ping - just activity ping + quick challenge check (2-3 seconds)
     // Use this for very frequent cron (every 10-15 seconds) to keep bot appearing online
     if ((url === '/fastping' || url === '/fast') && (method === 'GET' || method === 'POST')) {
         const startTime = Date.now();
@@ -1196,12 +1196,12 @@ export default async function handler(req, res) {
             // Activity ping
             const account = await activityPing();
             
-            // Quick peek for challenges
-            const events = await quickEventPeek();
+            // Quick REST-based challenge check
+            const challenges = await quickChallengeCheck();
             let challengesProcessed = 0;
             
-            if (events.length > 0) {
-                challengesProcessed = await processQuickEvents(events);
+            if (challenges.length > 0) {
+                challengesProcessed = await processQuickChallenges(challenges);
             }
             
             // Quick check if we have any games where it's our turn
