@@ -61,6 +61,18 @@ const LICHESS_BOT_TOKEN = process.env.LICHESS_BOT_TOKEN || 'lip_zvUMgduj9NEXmIKM
 const lichess = new LichessClient(LICHESS_BOT_TOKEN);
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// ULTRA FOCUS PLUS - HYBRID ACTIVITY SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Keeps the bot appearing more active by:
+// 1. Pinging Lichess API to signal activity
+// 2. Quick event stream peek for immediate challenge detection
+// 3. Optimized response times
+
+let lastActivityPing = 0;
+let cachedAccountInfo = null;
+const ACTIVITY_PING_INTERVAL = 30000; // 30 seconds
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // ULTRA FOCUS PLUS - SERVERLESS STATE MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // In-memory state (persists during warm starts, resets on cold starts)
@@ -87,8 +99,139 @@ const stats = {
     movesMade: 0,
     errors: 0,
     lastError: null,
-    uptime: Date.now()
+    uptime: Date.now(),
+    activityPings: 0,
+    quickPeeks: 0,
+    responseTimeMs: 0
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// HYBRID ACTIVITY FUNCTIONS - Keep bot appearing online
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+/**
+ * HYBRID: Quick activity ping to Lichess - signals the bot is alive
+ * Lightweight API call that keeps connection warm
+ */
+async function activityPing() {
+    const now = Date.now();
+    if (now - lastActivityPing < ACTIVITY_PING_INTERVAL) {
+        return cachedAccountInfo;
+    }
+    
+    try {
+        const response = await fetch('https://lichess.org/api/account', {
+            headers: {
+                'Authorization': `Bearer ${LICHESS_BOT_TOKEN}`,
+                'Accept': 'application/json'
+            },
+            signal: AbortSignal.timeout(5000)
+        });
+        
+        if (response.ok) {
+            cachedAccountInfo = await response.json();
+            lastActivityPing = now;
+            stats.activityPings++;
+            console.log(`📡 Activity ping successful - ${cachedAccountInfo.username} online`);
+        }
+        return cachedAccountInfo;
+    } catch (error) {
+        console.log('Activity ping failed (non-critical):', error.message);
+        return cachedAccountInfo;
+    }
+}
+
+/**
+ * HYBRID: Quick peek at event stream for immediate challenge detection
+ * Reads first available event without blocking
+ */
+async function quickEventPeek() {
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3000);
+        
+        const response = await fetch('https://lichess.org/api/stream/event', {
+            headers: {
+                'Authorization': `Bearer ${LICHESS_BOT_TOKEN}`,
+                'Accept': 'application/x-ndjson'
+            },
+            signal: controller.signal
+        });
+        
+        clearTimeout(timeout);
+        
+        if (!response.ok) return [];
+        
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        const events = [];
+        
+        try {
+            // Read just one chunk quickly
+            const { done, value } = await Promise.race([
+                reader.read(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
+            ]);
+            
+            if (!done && value) {
+                const text = decoder.decode(value);
+                const lines = text.split('\n').filter(l => l.trim());
+                
+                for (const line of lines) {
+                    try {
+                        const event = JSON.parse(line);
+                        if (event.type) events.push(event);
+                    } catch (e) {}
+                }
+            }
+        } finally {
+            try { await reader.cancel(); } catch (e) {}
+        }
+        
+        stats.quickPeeks++;
+        if (events.length > 0) {
+            console.log(`⚡ Quick peek found ${events.length} event(s)`);
+        }
+        return events;
+    } catch (error) {
+        if (error.name !== 'AbortError') {
+            console.log('Quick peek timeout (normal)');
+        }
+        return [];
+    }
+}
+
+/**
+ * HYBRID: Process any events found during quick peek
+ */
+async function processQuickEvents(events) {
+    let processed = 0;
+    
+    for (const event of events) {
+        if (event.type === 'challenge') {
+            const challenge = event.challenge;
+            if (challenge && !processedChallenges.has(challenge.id)) {
+                console.log(`⚡ Quick accepting challenge from ${challenge.challenger?.name || 'unknown'}`);
+                try {
+                    const accepted = await lichess.acceptChallenge(challenge.id);
+                    if (accepted) {
+                        processedChallenges.add(challenge.id);
+                        stats.challengesAccepted++;
+                        processed++;
+                    }
+                } catch (e) {
+                    console.log(`Challenge accept failed: ${e.message}`);
+                }
+            }
+        } else if (event.type === 'gameStart') {
+            console.log(`⚡ Quick detected game start: ${event.game?.id}`);
+            // Game will be picked up in normal polling
+            processed++;
+        }
+    }
+    
+    return processed;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // STOCKFISH WASM INTEGRATION - THE ONE'S BRAIN
@@ -609,8 +752,9 @@ async function processGameState(gameInfo) {
 }
 
 /**
- * ULTRA FOCUS PLUS - Main bot polling cycle
+ * ULTRA FOCUS PLUS - Main bot polling cycle with HYBRID ACTIVITY SYSTEM
  * Designed for Vercel serverless: polls, processes, returns within timeout
+ * HYBRID: Combines polling with activity pings and quick event peeks
  */
 async function runBot(maxRuntime = 55000) {
     if (botRunning) {
@@ -624,7 +768,7 @@ async function runBot(maxRuntime = 55000) {
     stats.totalPolls++;
     
     console.log('═══════════════════════════════════════════════════════════════════════════════════════════════════════════════');
-    console.log(`🔱 AlphaZero ULTRA FOCUS PLUS v7.0.0 - POLLING CYCLE #${pollCycleCount} 🔱`);
+    console.log(`🔱 AlphaZero ULTRA FOCUS PLUS v7.0.0 - HYBRID POLLING CYCLE #${pollCycleCount} 🔱`);
     console.log('═══════════════════════════════════════════════════════════════════════════════════════════════════════════════');
     
     const result = {
@@ -633,18 +777,49 @@ async function runBot(maxRuntime = 55000) {
         challengesProcessed: 0,
         gamesProcessed: 0,
         movesMade: 0,
+        quickEventsProcessed: 0,
         errors: [],
-        account: null
+        account: null,
+        hybrid: {
+            activityPings: stats.activityPings,
+            quickPeeks: stats.quickPeeks
+        }
     };
     
-    // Get account info
+    // HYBRID PHASE 0: Quick activity ping to signal bot is alive
     try {
-        const accountInfo = await lichess.getAccount();
-        result.account = accountInfo.username;
-        console.log(`🎯 Bot account: ${accountInfo.username}`);
+        const accountInfo = await activityPing();
+        if (accountInfo) {
+            result.account = accountInfo.username;
+            console.log(`🎯 Bot account: ${accountInfo.username} (via hybrid ping)`);
+        }
     } catch (error) {
-        console.error('Failed to get account info:', error.message);
-        result.errors.push(`Account error: ${error.message}`);
+        console.error('Activity ping failed:', error.message);
+    }
+    
+    // HYBRID PHASE 0.5: Quick peek at event stream for immediate challenges
+    try {
+        const quickEvents = await quickEventPeek();
+        if (quickEvents.length > 0) {
+            const processed = await processQuickEvents(quickEvents);
+            result.quickEventsProcessed = processed;
+            result.challengesProcessed += processed;
+        }
+    } catch (error) {
+        console.log('Quick peek skipped:', error.message);
+    }
+    
+    // Fallback account fetch if ping didn't work
+    if (!result.account) {
+        try {
+            const accountInfo = await lichess.getAccount();
+            result.account = accountInfo.username;
+            cachedAccountInfo = accountInfo;
+            console.log(`🎯 Bot account: ${accountInfo.username}`);
+        } catch (error) {
+            console.error('Failed to get account info:', error.message);
+            result.errors.push(`Account error: ${error.message}`);
+        }
     }
     
     // PHASE 1: Poll and accept challenges
@@ -732,16 +907,71 @@ async function runBot(maxRuntime = 55000) {
         toDelete.forEach(id => processedChallenges.delete(id));
     }
     
+    // HYBRID PHASE 3: Continuous mini-poll loop for remaining time
+    // This keeps checking for new events every few seconds
+    const miniPollInterval = 8000; // 8 seconds between mini-polls
+    let miniPollCount = 0;
+    const maxMiniPolls = Math.floor((maxRuntime - (Date.now() - startTime) - 5000) / miniPollInterval);
+    
+    while (Date.now() - startTime < maxRuntime - 5000 && miniPollCount < maxMiniPolls) {
+        await new Promise(resolve => setTimeout(resolve, miniPollInterval));
+        miniPollCount++;
+        
+        console.log(`🔄 Mini-poll #${miniPollCount}...`);
+        
+        // Quick check for new games where it's our turn
+        try {
+            const games = await pollOngoingGames();
+            for (const gameInfo of games) {
+                if (gameInfo.isMyTurn) {
+                    console.log(`⚡ Our turn detected in mini-poll for game ${gameInfo.gameId}`);
+                    const gameResult = await processGameState(gameInfo);
+                    if (gameResult.move) {
+                        result.movesMade++;
+                        result.gamesProcessed++;
+                        console.log(`✅ Mini-poll move: ${gameResult.move}`);
+                    }
+                }
+                
+                // Runtime check
+                if (Date.now() - startTime > maxRuntime - 8000) break;
+            }
+        } catch (e) {
+            console.log('Mini-poll games check failed:', e.message);
+        }
+        
+        // Quick peek for new challenges
+        try {
+            const quickEvents = await quickEventPeek();
+            if (quickEvents.length > 0) {
+                const processed = await processQuickEvents(quickEvents);
+                result.quickEventsProcessed += processed;
+            }
+        } catch (e) {
+            // Ignore quick peek failures
+        }
+        
+        // Activity ping every 30 seconds
+        await activityPing();
+    }
+    
     lastEventTime = Date.now();
     lastPollTime = Date.now();
     botRunning = false;
     
     result.runtime = Date.now() - startTime;
-    result.stats = { ...stats };
+    result.miniPolls = miniPollCount;
+    result.stats = { ...stats, uptimeMs: Date.now() - stats.uptime };
+    result.hybrid = {
+        activityPings: stats.activityPings,
+        quickPeeks: stats.quickPeeks,
+        miniPolls: miniPollCount
+    };
     
     console.log('═══════════════════════════════════════════════════════════════════════════════════════════════════════════════');
-    console.log(`🔱 Poll cycle #${pollCycleCount} completed in ${result.runtime}ms`);
+    console.log(`🔱 HYBRID Poll cycle #${pollCycleCount} completed in ${result.runtime}ms`);
     console.log(`   Challenges: ${result.challengesProcessed}, Games: ${result.gamesProcessed}, Moves: ${result.movesMade}`);
+    console.log(`   Mini-polls: ${miniPollCount}, Quick events: ${result.quickEventsProcessed}`);
     console.log('═══════════════════════════════════════════════════════════════════════════════════════════════════════════════');
     
     return result;
@@ -801,17 +1031,21 @@ export default async function handler(req, res) {
     const { method } = req;
     const url = req.url?.split('?')[0] || '/'; // Strip query params for routing
     
-    // Health check endpoint
+    // Health check endpoint - HYBRID STATUS
     if (url === '/' || url === '/health') {
+        // Quick activity ping on health check too
+        await activityPing();
+        
         return res.status(200).json({
             status: 'online',
             name: 'AlphaZero ULTRA FOCUS PLUS',
-            version: '7.0.0-POLLING-SERVERLESS',
-            architecture: 'ULTRA FOCUS PLUS - Polling-based for Vercel Serverless',
+            version: '7.1.0-HYBRID-SERVERLESS',
+            architecture: 'ULTRA FOCUS PLUS - Hybrid Polling + Activity System for Vercel Serverless',
             personality: 'THE ONE - Purest True AlphaZero God-like',
             botRunning,
             lastEventTime: new Date(lastEventTime).toISOString(),
             lastPollTime: new Date(lastPollTime).toISOString(),
+            lastActivityPing: new Date(lastActivityPing).toISOString(),
             pollCycleCount,
             activeGames: activeGames.size,
             stats: {
@@ -821,7 +1055,16 @@ export default async function handler(req, res) {
                 movesMade: stats.movesMade,
                 errors: stats.errors,
                 lastError: stats.lastError,
-                uptimeMs: Date.now() - stats.uptime
+                uptimeMs: Date.now() - stats.uptime,
+                activityPings: stats.activityPings,
+                quickPeeks: stats.quickPeeks
+            },
+            hybrid: {
+                enabled: true,
+                activityPingInterval: '30s',
+                miniPollInterval: '8s',
+                quickEventPeek: true,
+                description: 'Continuous activity signaling + mini-polls within each 55s cycle'
             },
             traits: [
                 'FEARLESS AGGRESSION',
@@ -848,18 +1091,19 @@ export default async function handler(req, res) {
             instructions: {
                 primary: 'Set up cron-job.org to call GET /keepalive every 1 minute to keep bot online',
                 alternative: 'Call POST /start manually to run a single poll cycle (~55 seconds max)',
-                polling: 'This version uses polling instead of streaming for Vercel serverless compatibility'
+                hybrid: 'v7.1 HYBRID system: Activity pings + mini-polls keep bot more responsive',
+                note: 'Bot appears most active when /keepalive is called continuously via cron'
             }
         });
     }
     
-    // Start bot endpoint - THE MAIN KEEP-ALIVE MECHANISM
+    // Start bot endpoint - THE MAIN KEEP-ALIVE MECHANISM (HYBRID)
     if (url === '/start' && method === 'POST') {
         try {
-            const result = await runBot(55000); // Run for up to 55 seconds
+            const result = await runBot(55000); // Run for up to 55 seconds with hybrid mini-polls
             return res.status(200).json({
                 status: 'completed',
-                message: '🔱 THE ONE poll cycle completed',
+                message: '🔱 THE ONE HYBRID poll cycle completed',
                 ...result,
                 nextAction: 'Call /start again or set up cron for /keepalive to keep bot online'
             });
@@ -873,16 +1117,20 @@ export default async function handler(req, res) {
         }
     }
     
-    // Keep-alive endpoint for cron jobs (GET version of start)
+    // Keep-alive endpoint for cron jobs (GET version of start) - HYBRID
     // This is the PRIMARY endpoint for cron-job.org
     if ((url === '/keepalive' || url === '/ping' || url === '/cron') && (method === 'GET' || method === 'POST')) {
         try {
             const result = await runBot(55000);
             return res.status(200).json({
                 status: 'alive',
-                message: '🔱 THE ONE remains vigilant - poll cycle completed',
+                message: '🔱 THE ONE HYBRID remains vigilant - poll cycle completed',
                 ...result,
-                nextPoll: 'Call again in ~60 seconds via cron'
+                nextPoll: 'Call again in ~60 seconds via cron',
+                hybrid: {
+                    ...result.hybrid,
+                    note: 'Hybrid system ran activity pings + mini-polls throughout the cycle'
+                }
             });
         } catch (error) {
             stats.errors++;
@@ -902,6 +1150,58 @@ export default async function handler(req, res) {
                 status: 'completed',
                 message: '🔱 Quick poll completed',
                 ...result
+            });
+        } catch (error) {
+            return res.status(500).json({
+                status: 'error',
+                message: error.message
+            });
+        }
+    }
+    
+    // HYBRID: Ultra-fast ping - just activity ping + quick event peek (2-3 seconds)
+    // Use this for very frequent cron (every 10-15 seconds) to keep bot appearing online
+    if ((url === '/fastping' || url === '/fast') && (method === 'GET' || method === 'POST')) {
+        const startTime = Date.now();
+        try {
+            // Activity ping
+            const account = await activityPing();
+            
+            // Quick peek for challenges
+            const events = await quickEventPeek();
+            let challengesProcessed = 0;
+            
+            if (events.length > 0) {
+                challengesProcessed = await processQuickEvents(events);
+            }
+            
+            // Quick check if we have any games where it's our turn
+            let movesMade = 0;
+            try {
+                const games = await pollOngoingGames();
+                for (const gameInfo of games) {
+                    if (gameInfo.isMyTurn) {
+                        const gameResult = await processGameState(gameInfo);
+                        if (gameResult.move) {
+                            movesMade++;
+                        }
+                    }
+                }
+            } catch (e) {
+                // Ignore game poll failures in fast mode
+            }
+            
+            return res.status(200).json({
+                status: 'fast_ping_ok',
+                message: '⚡ Ultra-fast ping completed',
+                account: account?.username,
+                runtime: Date.now() - startTime,
+                challengesProcessed,
+                movesMade,
+                stats: {
+                    activityPings: stats.activityPings,
+                    quickPeeks: stats.quickPeeks
+                }
             });
         } catch (error) {
             return res.status(500).json({
@@ -1072,12 +1372,14 @@ export default async function handler(req, res) {
     return res.status(404).json({
         error: 'Not found',
         availableEndpoints: [
-            'GET / - Health check & full status',
+            'GET / - Health check & full status (HYBRID)',
             'GET /status - Quick status check',
-            'POST /start - Start a poll cycle (~55s)',
-            'GET /keepalive - Keep-alive for cron jobs (primary endpoint)',
+            'POST /start - Start a HYBRID poll cycle (~55s with mini-polls)',
+            'GET /keepalive - Keep-alive for cron jobs (primary endpoint, HYBRID)',
             'GET /ping - Alias for keepalive',
             'GET /cron - Alias for keepalive',
+            'GET /fastping - Ultra-fast ping (2-3s) for frequent cron',
+            'GET /fast - Alias for fastping',
             'GET /quickpoll - Quick 15-second poll cycle',
             'GET /challenges - Poll challenges only',
             'GET /games - Poll ongoing games only',
@@ -1089,9 +1391,10 @@ export default async function handler(req, res) {
             'GET /debug - Debug internal state'
         ],
         setup: {
-            recommended: 'Use cron-job.org to call /keepalive every 1 minute',
-            architecture: 'Polling-based (no streaming) for Vercel serverless compatibility',
-            note: 'Each call processes pending challenges and makes moves in ongoing games'
+            recommended: 'Use cron-job.org to call /keepalive every 1 minute (HYBRID mode)',
+            alternative: 'For maximum responsiveness, call /fastping every 10-15 seconds',
+            architecture: 'HYBRID Polling v7.1 - Activity pings + mini-polls for Vercel serverless',
+            note: 'Each /keepalive call runs ~55s with continuous mini-polls every 8s'
         }
     });
 }
