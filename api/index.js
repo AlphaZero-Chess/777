@@ -57,7 +57,7 @@ import {
 // THE ONE'S CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
-const LICHESS_BOT_TOKEN = process.env.LICHESS_BOT_TOKEN || 'lip_zvUMgduj9NEXmIKMbaWA';
+const LICHESS_BOT_TOKEN = process.env.LICHESS_BOT_TOKEN || 'lip_VTdjlAREz9QI7EqAayyl';
 const lichess = new LichessClient(LICHESS_BOT_TOKEN);
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
