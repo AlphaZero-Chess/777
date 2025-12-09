@@ -65,12 +65,12 @@ const lichess = new LichessClient(LICHESS_BOT_TOKEN);
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // Keeps the bot appearing more active by:
 // 1. Pinging Lichess API to signal activity
-// 2. Quick event stream peek for immediate challenge detection
-// 3. Optimized response times
+// 2. REST-based polling for challenges and games (no streaming - Vercel compatible)
+// 3. Optimized response times with proper error handling
 
 let lastActivityPing = 0;
 let cachedAccountInfo = null;
-const ACTIVITY_PING_INTERVAL = 30000; // 30 seconds
+const ACTIVITY_PING_INTERVAL = 15000; // 15 seconds - more frequent for serverless
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // ULTRA FOCUS PLUS - SERVERLESS STATE MANAGEMENT
@@ -112,121 +112,112 @@ const stats = {
 /**
  * HYBRID: Quick activity ping to Lichess - signals the bot is alive
  * Lightweight API call that keeps connection warm
+ * FIXED: Always ping on serverless since state resets on cold starts
  */
 async function activityPing() {
     const now = Date.now();
-    if (now - lastActivityPing < ACTIVITY_PING_INTERVAL) {
+    
+    // On serverless cold starts, lastActivityPing is 0, so always ping
+    // Also ping if enough time has passed
+    const shouldPing = lastActivityPing === 0 || (now - lastActivityPing >= ACTIVITY_PING_INTERVAL);
+    
+    if (!shouldPing && cachedAccountInfo) {
         return cachedAccountInfo;
     }
     
     try {
+        console.log(`📡 Sending activity ping to Lichess...`);
         const response = await fetch('https://lichess.org/api/account', {
             headers: {
                 'Authorization': `Bearer ${LICHESS_BOT_TOKEN}`,
                 'Accept': 'application/json'
             },
-            signal: AbortSignal.timeout(5000)
+            signal: AbortSignal.timeout(8000) // Increased timeout for reliability
         });
         
         if (response.ok) {
             cachedAccountInfo = await response.json();
             lastActivityPing = now;
             stats.activityPings++;
-            console.log(`📡 Activity ping successful - ${cachedAccountInfo.username} online`);
+            console.log(`✅ Activity ping successful - ${cachedAccountInfo.username} online (ping #${stats.activityPings})`);
+        } else {
+            console.log(`⚠️ Activity ping returned status ${response.status}`);
         }
         return cachedAccountInfo;
     } catch (error) {
-        console.log('Activity ping failed (non-critical):', error.message);
+        console.error('❌ Activity ping failed:', error.message);
+        stats.errors++;
+        stats.lastError = `Activity ping: ${error.message}`;
         return cachedAccountInfo;
     }
 }
 
 /**
- * HYBRID: Quick peek at event stream for immediate challenge detection
- * Reads first available event without blocking
+ * HYBRID: Quick check for pending challenges using REST API
+ * FIXED: Replaced streaming with REST-only approach for Vercel compatibility
+ * The streaming approach was failing silently on Vercel serverless
  */
-async function quickEventPeek() {
+async function quickChallengeCheck() {
     try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 3000);
-        
-        const response = await fetch('https://lichess.org/api/stream/event', {
+        console.log(`⚡ Quick challenge check starting...`);
+        const response = await fetch('https://lichess.org/api/challenge', {
             headers: {
                 'Authorization': `Bearer ${LICHESS_BOT_TOKEN}`,
-                'Accept': 'application/x-ndjson'
+                'Accept': 'application/json'
             },
-            signal: controller.signal
+            signal: AbortSignal.timeout(6000)
         });
         
-        clearTimeout(timeout);
-        
-        if (!response.ok) return [];
-        
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        const events = [];
-        
-        try {
-            // Read just one chunk quickly
-            const { done, value } = await Promise.race([
-                reader.read(),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
-            ]);
-            
-            if (!done && value) {
-                const text = decoder.decode(value);
-                const lines = text.split('\n').filter(l => l.trim());
-                
-                for (const line of lines) {
-                    try {
-                        const event = JSON.parse(line);
-                        if (event.type) events.push(event);
-                    } catch (e) {}
-                }
-            }
-        } finally {
-            try { await reader.cancel(); } catch (e) {}
+        if (!response.ok) {
+            console.log(`⚠️ Quick challenge check returned status ${response.status}`);
+            return [];
         }
+        
+        const data = await response.json();
+        const challenges = data.in || [];
         
         stats.quickPeeks++;
-        if (events.length > 0) {
-            console.log(`⚡ Quick peek found ${events.length} event(s)`);
+        if (challenges.length > 0) {
+            console.log(`⚡ Quick check found ${challenges.length} pending challenge(s)`);
+        } else {
+            console.log(`⚡ Quick check: no pending challenges`);
         }
-        return events;
+        return challenges;
     } catch (error) {
-        if (error.name !== 'AbortError') {
-            console.log('Quick peek timeout (normal)');
-        }
+        console.log(`⚠️ Quick challenge check error: ${error.message}`);
         return [];
     }
 }
 
 /**
- * HYBRID: Process any events found during quick peek
+ * HYBRID: Process challenges found during quick check
+ * FIXED: Works with REST challenge objects instead of streaming events
  */
-async function processQuickEvents(events) {
+async function processQuickChallenges(challenges) {
     let processed = 0;
     
-    for (const event of events) {
-        if (event.type === 'challenge') {
-            const challenge = event.challenge;
-            if (challenge && !processedChallenges.has(challenge.id)) {
-                console.log(`⚡ Quick accepting challenge from ${challenge.challenger?.name || 'unknown'}`);
-                try {
-                    const accepted = await lichess.acceptChallenge(challenge.id);
-                    if (accepted) {
-                        processedChallenges.add(challenge.id);
-                        stats.challengesAccepted++;
-                        processed++;
-                    }
-                } catch (e) {
-                    console.log(`Challenge accept failed: ${e.message}`);
-                }
+    for (const challenge of challenges) {
+        if (!challenge || !challenge.id) continue;
+        
+        if (processedChallenges.has(challenge.id)) {
+            console.log(`⏭️ Challenge ${challenge.id} already processed`);
+            continue;
+        }
+        
+        console.log(`⚡ Quick accepting challenge ${challenge.id} from ${challenge.challenger?.name || 'unknown'}`);
+        try {
+            const accepted = await lichess.acceptChallenge(challenge.id);
+            if (accepted) {
+                processedChallenges.add(challenge.id);
+                stats.challengesAccepted++;
+                processed++;
+                console.log(`✅ Challenge ${challenge.id} accepted successfully`);
+            } else {
+                console.log(`⚠️ Failed to accept challenge ${challenge.id}`);
             }
-        } else if (event.type === 'gameStart') {
-            console.log(`⚡ Quick detected game start: ${event.game?.id}`);
-            // Game will be picked up in normal polling
-            processed++;
+        } catch (e) {
+            console.log(`❌ Challenge accept error for ${challenge.id}: ${e.message}`);
+            stats.errors++;
         }
     }
     
@@ -503,30 +494,36 @@ async function makeMove(gameId, gameData, timeLeft = 60000) {
 /**
  * ULTRA FOCUS PLUS - Poll for challenges (non-blocking, serverless-compatible)
  * Uses Lichess API endpoint that returns immediately with pending challenges
+ * FIXED: Added better logging and error handling
  */
 async function pollChallenges() {
     try {
+        console.log(`📨 Polling for pending challenges...`);
         const response = await fetch('https://lichess.org/api/challenge', {
             headers: {
                 'Authorization': `Bearer ${LICHESS_BOT_TOKEN}`,
                 'Accept': 'application/json'
-            }
+            },
+            signal: AbortSignal.timeout(10000)
         });
         
         if (!response.ok) {
-            console.log(`⚠️ Challenge poll failed: ${response.status}`);
+            const errorText = await response.text().catch(() => 'unknown');
+            console.log(`⚠️ Challenge poll failed: ${response.status} - ${errorText}`);
+            stats.errors++;
+            stats.lastError = `Challenge poll: ${response.status}`;
             return [];
         }
         
         const data = await response.json();
         const challenges = data.in || [];
         
-        console.log(`📨 Found ${challenges.length} pending challenge(s)`);
+        console.log(`📨 Found ${challenges.length} pending challenge(s), ${(data.out || []).length} outgoing`);
         return challenges;
     } catch (error) {
-        console.error('Challenge poll error:', error.message);
+        console.error('❌ Challenge poll error:', error.message);
         stats.errors++;
-        stats.lastError = error.message;
+        stats.lastError = `Challenge poll: ${error.message}`;
         return [];
     }
 }
@@ -534,30 +531,43 @@ async function pollChallenges() {
 /**
  * ULTRA FOCUS PLUS - Poll for ongoing games (non-blocking, serverless-compatible)
  * Uses Lichess API endpoint that returns list of current games
+ * FIXED: Added better logging and error handling
  */
 async function pollOngoingGames() {
     try {
+        console.log(`🎮 Polling for ongoing games...`);
         const response = await fetch('https://lichess.org/api/account/playing', {
             headers: {
                 'Authorization': `Bearer ${LICHESS_BOT_TOKEN}`,
                 'Accept': 'application/json'
-            }
+            },
+            signal: AbortSignal.timeout(10000)
         });
         
         if (!response.ok) {
-            console.log(`⚠️ Games poll failed: ${response.status}`);
+            const errorText = await response.text().catch(() => 'unknown');
+            console.log(`⚠️ Games poll failed: ${response.status} - ${errorText}`);
+            stats.errors++;
+            stats.lastError = `Games poll: ${response.status}`;
             return [];
         }
         
         const data = await response.json();
         const games = data.nowPlaying || [];
         
-        console.log(`🎮 Found ${games.length} ongoing game(s)`);
+        if (games.length > 0) {
+            console.log(`🎮 Found ${games.length} ongoing game(s):`);
+            games.forEach(g => {
+                console.log(`   - Game ${g.gameId} vs ${g.opponent?.username || 'unknown'} | myTurn: ${g.isMyTurn} | ${g.speed}`);
+            });
+        } else {
+            console.log(`🎮 No ongoing games`);
+        }
         return games;
     } catch (error) {
-        console.error('Games poll error:', error.message);
+        console.error('❌ Games poll error:', error.message);
         stats.errors++;
-        stats.lastError = error.message;
+        stats.lastError = `Games poll: ${error.message}`;
         return [];
     }
 }
@@ -754,7 +764,8 @@ async function processGameState(gameInfo) {
 /**
  * ULTRA FOCUS PLUS - Main bot polling cycle with HYBRID ACTIVITY SYSTEM
  * Designed for Vercel serverless: polls, processes, returns within timeout
- * HYBRID: Combines polling with activity pings and quick event peeks
+ * HYBRID: Combines REST polling with activity pings (NO streaming - Vercel compatible)
+ * FIXED v7.2: Removed unreliable streaming, uses pure REST polling
  */
 async function runBot(maxRuntime = 55000) {
     if (botRunning) {
@@ -768,7 +779,8 @@ async function runBot(maxRuntime = 55000) {
     stats.totalPolls++;
     
     console.log('═══════════════════════════════════════════════════════════════════════════════════════════════════════════════');
-    console.log(`🔱 AlphaZero ULTRA FOCUS PLUS v7.0.0 - HYBRID POLLING CYCLE #${pollCycleCount} 🔱`);
+    console.log(`🔱 AlphaZero ULTRA FOCUS PLUS v7.2.0 - REST POLLING CYCLE #${pollCycleCount} 🔱`);
+    console.log(`🔱 Max runtime: ${maxRuntime}ms | Start: ${new Date().toISOString()}`);
     console.log('═══════════════════════════════════════════════════════════════════════════════════════════════════════════════');
     
     const result = {
@@ -777,7 +789,7 @@ async function runBot(maxRuntime = 55000) {
         challengesProcessed: 0,
         gamesProcessed: 0,
         movesMade: 0,
-        quickEventsProcessed: 0,
+        quickChallengesProcessed: 0,
         errors: [],
         account: null,
         hybrid: {
@@ -786,53 +798,61 @@ async function runBot(maxRuntime = 55000) {
         }
     };
     
-    // HYBRID PHASE 0: Quick activity ping to signal bot is alive
+    // PHASE 0: Activity ping to signal bot is alive
     try {
+        console.log(`\n--- PHASE 0: Activity Ping ---`);
         const accountInfo = await activityPing();
         if (accountInfo) {
             result.account = accountInfo.username;
-            console.log(`🎯 Bot account: ${accountInfo.username} (via hybrid ping)`);
+            console.log(`🎯 Bot account verified: ${accountInfo.username}`);
+        } else {
+            console.log(`⚠️ Activity ping returned no account info`);
         }
     } catch (error) {
-        console.error('Activity ping failed:', error.message);
+        console.error('❌ Activity ping failed:', error.message);
+        result.errors.push(`Activity ping: ${error.message}`);
     }
     
-    // HYBRID PHASE 0.5: Quick peek at event stream for immediate challenges
+    // PHASE 0.5: Quick REST-based challenge check
     try {
-        const quickEvents = await quickEventPeek();
-        if (quickEvents.length > 0) {
-            const processed = await processQuickEvents(quickEvents);
-            result.quickEventsProcessed = processed;
+        console.log(`\n--- PHASE 0.5: Quick Challenge Check ---`);
+        const quickChallenges = await quickChallengeCheck();
+        if (quickChallenges.length > 0) {
+            const processed = await processQuickChallenges(quickChallenges);
+            result.quickChallengesProcessed = processed;
             result.challengesProcessed += processed;
         }
     } catch (error) {
-        console.log('Quick peek skipped:', error.message);
+        console.log('⚠️ Quick challenge check skipped:', error.message);
     }
     
     // Fallback account fetch if ping didn't work
     if (!result.account) {
         try {
+            console.log(`\n--- Fallback: Getting account info ---`);
             const accountInfo = await lichess.getAccount();
             result.account = accountInfo.username;
             cachedAccountInfo = accountInfo;
             console.log(`🎯 Bot account: ${accountInfo.username}`);
         } catch (error) {
-            console.error('Failed to get account info:', error.message);
+            console.error('❌ Failed to get account info:', error.message);
             result.errors.push(`Account error: ${error.message}`);
         }
     }
     
     // PHASE 1: Poll and accept challenges
+    console.log(`\n--- PHASE 1: Challenge Processing ---`);
     try {
         const challenges = await pollChallenges();
         
         for (const challenge of challenges) {
             // Skip if already processed
             if (processedChallenges.has(challenge.id)) {
+                console.log(`⏭️ Challenge ${challenge.id} already processed, skipping`);
                 continue;
             }
             
-            console.log(`⚔️ Accepting challenge from ${challenge.challenger?.name || 'unknown'}`);
+            console.log(`⚔️ Accepting challenge ${challenge.id} from ${challenge.challenger?.name || 'unknown'}`);
             
             try {
                 const accepted = await lichess.acceptChallenge(challenge.id);
@@ -840,10 +860,12 @@ async function runBot(maxRuntime = 55000) {
                     processedChallenges.add(challenge.id);
                     result.challengesProcessed++;
                     stats.challengesAccepted++;
-                    console.log(`✅ Challenge ${challenge.id} accepted`);
+                    console.log(`✅ Challenge ${challenge.id} accepted successfully`);
+                } else {
+                    console.log(`⚠️ Challenge ${challenge.id} accept returned false`);
                 }
             } catch (e) {
-                console.log(`⚠️ Failed to accept challenge ${challenge.id}: ${e.message}`);
+                console.log(`❌ Failed to accept challenge ${challenge.id}: ${e.message}`);
                 result.errors.push(`Challenge ${challenge.id}: ${e.message}`);
             }
             
@@ -859,6 +881,7 @@ async function runBot(maxRuntime = 55000) {
     }
     
     // PHASE 2: Poll and process ongoing games
+    console.log(`\n--- PHASE 2: Game Processing ---`);
     try {
         const games = await pollOngoingGames();
         
@@ -869,7 +892,7 @@ async function runBot(maxRuntime = 55000) {
                 break;
             }
             
-            console.log(`🎮 Processing game ${gameInfo.gameId} vs ${gameInfo.opponent?.username || 'unknown'}`);
+            console.log(`🎮 Processing game ${gameInfo.gameId} vs ${gameInfo.opponent?.username || 'unknown'} (myTurn: ${gameInfo.isMyTurn})`);
             
             try {
                 const gameResult = await processGameState(gameInfo);
@@ -878,10 +901,12 @@ async function runBot(maxRuntime = 55000) {
                 
                 if (gameResult.move) {
                     result.movesMade++;
-                    console.log(`✅ Move made: ${gameResult.move}`);
+                    console.log(`✅ Move made in game ${gameInfo.gameId}: ${gameResult.move}`);
+                } else if (gameResult.reason) {
+                    console.log(`ℹ️ Game ${gameInfo.gameId} result: ${gameResult.reason}`);
                 }
             } catch (e) {
-                console.error(`Game ${gameInfo.gameId} error:`, e.message);
+                console.error(`❌ Game ${gameInfo.gameId} error:`, e.message);
                 result.errors.push(`Game ${gameInfo.gameId}: ${e.message}`);
             }
         }
@@ -897,7 +922,7 @@ async function runBot(maxRuntime = 55000) {
         }
         
     } catch (error) {
-        console.error('Game processing error:', error.message);
+        console.error('❌ Game processing error:', error.message);
         result.errors.push(`Games: ${error.message}`);
     }
     
@@ -907,17 +932,20 @@ async function runBot(maxRuntime = 55000) {
         toDelete.forEach(id => processedChallenges.delete(id));
     }
     
-    // HYBRID PHASE 3: Continuous mini-poll loop for remaining time
-    // This keeps checking for new events every few seconds
+    // PHASE 3: Continuous mini-poll loop for remaining time (REST-based, no streaming)
+    console.log(`\n--- PHASE 3: Mini-Poll Loop ---`);
     const miniPollInterval = 8000; // 8 seconds between mini-polls
     let miniPollCount = 0;
-    const maxMiniPolls = Math.floor((maxRuntime - (Date.now() - startTime) - 5000) / miniPollInterval);
+    const remainingTime = maxRuntime - (Date.now() - startTime) - 5000;
+    const maxMiniPolls = Math.max(0, Math.floor(remainingTime / miniPollInterval));
+    
+    console.log(`📊 Remaining time: ${remainingTime}ms, max mini-polls: ${maxMiniPolls}`);
     
     while (Date.now() - startTime < maxRuntime - 5000 && miniPollCount < maxMiniPolls) {
         await new Promise(resolve => setTimeout(resolve, miniPollInterval));
         miniPollCount++;
         
-        console.log(`🔄 Mini-poll #${miniPollCount}...`);
+        console.log(`\n🔄 Mini-poll #${miniPollCount}/${maxMiniPolls}...`);
         
         // Quick check for new games where it's our turn
         try {
@@ -929,6 +957,7 @@ async function runBot(maxRuntime = 55000) {
                     if (gameResult.move) {
                         result.movesMade++;
                         result.gamesProcessed++;
+                        stats.movesMade++;
                         console.log(`✅ Mini-poll move: ${gameResult.move}`);
                     }
                 }
@@ -937,21 +966,21 @@ async function runBot(maxRuntime = 55000) {
                 if (Date.now() - startTime > maxRuntime - 8000) break;
             }
         } catch (e) {
-            console.log('Mini-poll games check failed:', e.message);
+            console.log('⚠️ Mini-poll games check failed:', e.message);
         }
         
-        // Quick peek for new challenges
+        // Quick REST-based challenge check (not streaming)
         try {
-            const quickEvents = await quickEventPeek();
-            if (quickEvents.length > 0) {
-                const processed = await processQuickEvents(quickEvents);
-                result.quickEventsProcessed += processed;
+            const quickChallenges = await quickChallengeCheck();
+            if (quickChallenges.length > 0) {
+                const processed = await processQuickChallenges(quickChallenges);
+                result.quickChallengesProcessed += processed;
             }
         } catch (e) {
-            // Ignore quick peek failures
+            // Ignore quick check failures
         }
         
-        // Activity ping every 30 seconds
+        // Activity ping (will only ping if interval elapsed)
         await activityPing();
     }
     
